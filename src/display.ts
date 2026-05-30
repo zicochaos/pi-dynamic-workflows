@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
