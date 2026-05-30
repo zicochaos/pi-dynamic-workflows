@@ -1,4 +1,4 @@
-import { defineTool, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 
 export interface StructuredOutputCapture<T = unknown> {
