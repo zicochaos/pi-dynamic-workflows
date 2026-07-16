@@ -76,12 +76,60 @@ export class WorkflowAgent {
   private readonly instructions?: string;
   private resourceLoaderAuthStorage?: AuthStorage;
   private resourceLoaderModelRegistry?: ModelRegistry;
+  /** Pi 0.80 ModelRuntime instance (typed loosely for peer dep 0.78). */
+  private resourceLoaderModelRuntime?: any;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
     this.sessionOptions = options.session ?? {};
     this.instructions = options.instructions;
+  }
+
+  /**
+   * Pi 0.80 services expose `modelRuntime`. ModelRegistry is a sync facade
+   * (`new ModelRegistry(runtime)` on 0.80; 0.78 used a private ctor + create()).
+   */
+  private registryFromRuntime(runtime: any): ModelRegistry {
+    try {
+      return new (ModelRegistry as any)(runtime) as ModelRegistry;
+    } catch {
+      // Fallback: duck-typed facade matching getAll/getAvailable/find/registerProvider.
+      return {
+        getAll: () => [...(runtime.getModels?.() ?? [])],
+        getAvailable: () => [...(runtime.getAvailableSnapshot?.() ?? [])],
+        find: (provider: string, modelId: string) => runtime.getModel?.(provider, modelId),
+        registerProvider: (name: string, config: unknown) => runtime.registerProvider?.(name, config),
+        unregisterProvider: (name: string) => runtime.unregisterProvider?.(name),
+      } as unknown as ModelRegistry;
+    }
+  }
+
+  private async resolveModelRegistry(agentDir: string): Promise<ModelRegistry> {
+    const sessionOpts = this.sessionOptions as any;
+    if (sessionOpts.modelRegistry) return sessionOpts.modelRegistry as ModelRegistry;
+    if (sessionOpts.modelRuntime) return this.registryFromRuntime(sessionOpts.modelRuntime);
+
+    // Prefer ModelRuntime.create (Pi 0.80+); fall back to ModelRegistry.create if present.
+    const codingAgent = await import("@earendil-works/pi-coding-agent");
+    const ModelRuntimeCtor = (codingAgent as any).ModelRuntime;
+    if (ModelRuntimeCtor?.create) {
+      this.resourceLoaderModelRuntime ??= await ModelRuntimeCtor.create({
+        authPath: join(agentDir, "auth.json"),
+        modelsPath: join(agentDir, "models.json"),
+      });
+      this.resourceLoaderModelRegistry ??= this.registryFromRuntime(this.resourceLoaderModelRuntime);
+      return this.resourceLoaderModelRegistry;
+    }
+
+    this.resourceLoaderAuthStorage ??= AuthStorage.create(join(agentDir, "auth.json"));
+    const create = (ModelRegistry as any).create;
+    if (typeof create === "function") {
+      this.resourceLoaderModelRegistry ??= create(this.resourceLoaderAuthStorage, join(agentDir, "models.json"));
+      return this.resourceLoaderModelRegistry!;
+    }
+
+    throw new Error("Unable to create a ModelRegistry/ModelRuntime for workflow subagents");
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
@@ -129,18 +177,24 @@ export class WorkflowAgent {
     const agentDir = this.sessionOptions.agentDir ?? getAgentDir();
     const sessionManager = this.sessionOptions.sessionManager ?? SessionManager.inMemory(cwd);
     const excludeTools = [...new Set([...(this.sessionOptions.excludeTools ?? []), "workflow"])];
+    const sessionOpts = this.sessionOptions as any;
 
     if (!this.sessionOptions.resourceLoader) {
-      const services = await createAgentSessionServices({
+      // Pi 0.80+: services.modelRuntime (not modelRegistry).
+      const services: any = await createAgentSessionServices({
         cwd,
         agentDir,
-        authStorage: this.sessionOptions.authStorage,
         settingsManager: this.sessionOptions.settingsManager,
-        modelRegistry: this.sessionOptions.modelRegistry,
-      });
+        ...(sessionOpts.modelRuntime ? { modelRuntime: sessionOpts.modelRuntime } : {}),
+      } as any);
+
+      const modelRegistry: ModelRegistry =
+        services.modelRegistry ??
+        (services.modelRuntime ? this.registryFromRuntime(services.modelRuntime) : await this.resolveModelRegistry(agentDir));
+
       const { model, thinkingLevel } = this.resolveModelSpec(
         modelSpec,
-        services.modelRegistry,
+        modelRegistry,
         this.sessionOptions.model?.provider ?? services.settingsManager.getDefaultProvider(),
         this.sessionOptions.model,
       );
@@ -160,16 +214,7 @@ export class WorkflowAgent {
       });
     }
 
-    let authStorage = this.sessionOptions.authStorage;
-    if (!authStorage) {
-      this.resourceLoaderAuthStorage ??= AuthStorage.create(join(agentDir, "auth.json"));
-      authStorage = this.resourceLoaderAuthStorage;
-    }
-    let modelRegistry = this.sessionOptions.modelRegistry;
-    if (!modelRegistry) {
-      this.resourceLoaderModelRegistry ??= ModelRegistry.create(authStorage, join(agentDir, "models.json"));
-      modelRegistry = this.resourceLoaderModelRegistry;
-    }
+    const modelRegistry = await this.resolveModelRegistry(agentDir);
     const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
     const extensionsResult = this.sessionOptions.resourceLoader.getExtensions();
     const failedProviderRegistrations: typeof extensionsResult.runtime.pendingProviderRegistrations = [];
@@ -189,19 +234,25 @@ export class WorkflowAgent {
     );
     const resolvedThinkingLevel = this.resolveThinkingLevel(thinkingLevel, model);
 
-    return createAgentSession({
+    // Prefer modelRuntime on Pi 0.80; fall back to modelRegistry on older peers.
+    const sessionCreateOpts: any = {
       cwd,
       agentDir,
       sessionManager,
       settingsManager,
       customTools: this.sessionOptions.customTools ?? customTools,
-      authStorage,
-      modelRegistry,
       ...this.sessionOptions,
       excludeTools,
       ...(model ? { model } : {}),
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel as ThinkingLevel } : {}),
-    });
+    };
+    if (this.resourceLoaderModelRuntime) {
+      sessionCreateOpts.modelRuntime = this.resourceLoaderModelRuntime;
+      delete sessionCreateOpts.modelRegistry;
+    } else {
+      sessionCreateOpts.modelRegistry = modelRegistry;
+    }
+    return createAgentSession(sessionCreateOpts);
   }
 
   private resolveThinkingLevel(
